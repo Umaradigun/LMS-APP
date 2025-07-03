@@ -1,54 +1,89 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 interface RateLimitConfig {
-  maxRequests: number;
   windowMs: number;
+  maxRequests: number;
 }
 
+export const rateLimits = {
+  api: { windowMs: 15 * 60 * 1000, maxRequests: 100 }, // 100 requests per 15 minutes
+  auth: { windowMs: 15 * 60 * 1000, maxRequests: 5 },  // 5 requests per 15 minutes
+  upload: { windowMs: 60 * 60 * 1000, maxRequests: 10 }, // 10 requests per hour
+};
+
+// In-memory store for rate limiting (use Redis in production)
 const requestCounts = new Map<string, { count: number; resetTime: number }>();
 
+function getClientId(req: NextRequest): string {
+  // Use IP address as client identifier
+  const forwarded = req.headers.get('x-forwarded-for');
+  const ip = forwarded ? forwarded.split(',')[0] : req.headers.get('x-real-ip') || 'unknown';
+  return ip;
+}
+
 export function withRateLimit(config: RateLimitConfig) {
-  return function(handler: (req: NextRequest) => Promise<Response>) {
-    return async (req: NextRequest) => {
-      const clientIp = req.ip || req.headers.get('x-forwarded-for') || 'unknown';
+  return function (handler: (req: NextRequest) => Promise<NextResponse>) {
+    return async function (req: NextRequest) {
+      const clientId = getClientId(req);
       const now = Date.now();
+      const key = `${clientId}:${req.nextUrl.pathname}`;
       
-      const clientData = requestCounts.get(clientIp);
-      
-      if (!clientData || now > clientData.resetTime) {
-        requestCounts.set(clientIp, { 
-          count: 1, 
-          resetTime: now + config.windowMs 
-        });
-        return await handler(req);
+      // Clean up expired entries
+      for (const [k, v] of requestCounts.entries()) {
+        if (now > v.resetTime) {
+          requestCounts.delete(k);
+        }
       }
       
-      if (clientData.count >= config.maxRequests) {
+      const current = requestCounts.get(key);
+      
+      if (!current) {
+        // First request from this client
+        requestCounts.set(key, {
+          count: 1,
+          resetTime: now + config.windowMs,
+        });
+      } else if (now > current.resetTime) {
+        // Window has expired, reset
+        requestCounts.set(key, {
+          count: 1,
+          resetTime: now + config.windowMs,
+        });
+      } else if (current.count >= config.maxRequests) {
+        // Rate limit exceeded
+        const resetIn = Math.ceil((current.resetTime - now) / 1000);
+        
         return NextResponse.json(
-          { 
-            success: false, 
+          {
+            success: false,
             error: 'Rate limit exceeded',
-            retryAfter: Math.ceil((clientData.resetTime - now) / 1000)
+            resetIn,
           },
-          { 
+          {
             status: 429,
             headers: {
-              'Retry-After': Math.ceil((clientData.resetTime - now) / 1000).toString(),
-            }
+              'X-RateLimit-Limit': config.maxRequests.toString(),
+              'X-RateLimit-Remaining': '0',
+              'X-RateLimit-Reset': current.resetTime.toString(),
+              'Retry-After': resetIn.toString(),
+            },
           }
         );
+      } else {
+        // Increment count
+        current.count++;
       }
       
-      clientData.count++;
-      return await handler(req);
+      const remaining = Math.max(0, config.maxRequests - (current?.count || 0));
+      
+      const response = await handler(req);
+      
+      // Add rate limit headers to response
+      response.headers.set('X-RateLimit-Limit', config.maxRequests.toString());
+      response.headers.set('X-RateLimit-Remaining', remaining.toString());
+      response.headers.set('X-RateLimit-Reset', (current?.resetTime || now + config.windowMs).toString());
+      
+      return response;
     };
   };
 }
-
-// Predefined rate limit configurations
-export const rateLimits = {
-  auth: { maxRequests: 5, windowMs: 15 * 60 * 1000 }, // 5 requests per 15 minutes
-  api: { maxRequests: 100, windowMs: 15 * 60 * 1000 }, // 100 requests per 15 minutes
-  upload: { maxRequests: 10, windowMs: 60 * 1000 }, // 10 requests per minute
-  webhook: { maxRequests: 50, windowMs: 60 * 1000 }, // 50 requests per minute
-};

@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { withRole, AuthenticatedRequest } from '@/lib/middleware/auth';
-import { withRateLimit, rateLimits } from '@/lib/middleware/rate-limit';
 import { createServiceClient } from '@/lib/supabase/server';
+
 
 /**
  * @swagger
@@ -97,119 +96,78 @@ import { createServiceClient } from '@/lib/supabase/server';
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-async function getAdminDashboardHandler(req: AuthenticatedRequest) {
-  const supabase = createServiceClient();
-
-  try {
-    // Get total users count
-    const { count: totalUsers } = await supabase
-      .from('users')
-      .select('*', { count: 'exact', head: true })
-      .eq('status', 'ACTIVE');
-
-    // Get total courses count
-    const { count: totalCourses } = await supabase
-      .from('courses')
-      .select('*', { count: 'exact', head: true });
-
-    // Get total revenue
-    const { data: revenueData } = await supabase
-      .from('transactions')
-      .select('amount')
-      .eq('status', 'COMPLETED');
-
-    const totalRevenue = revenueData?.reduce((sum, transaction) => sum + transaction.amount, 0) || 0;
-
-    // Get user registrations for the last 30 days
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-
-    const { data: userRegistrations } = await supabase
-      .from('users')
-      .select('created_at')
-      .gte('created_at', thirtyDaysAgo.toISOString())
-      .order('created_at', { ascending: true });
-
-    // Group by date
-    const registrationsByDate = userRegistrations?.reduce((acc, user) => {
-      const date = new Date(user.created_at).toISOString().split('T')[0];
-      acc[date] = (acc[date] || 0) + 1;
-      return acc;
-    }, {} as Record<string, number>) || {};
-
-    const userRegistrationsChart = Object.entries(registrationsByDate).map(([date, count]) => ({
-      date,
-      count,
-    }));
-
-    // Get revenue stats for the last 12 months
-    const twelveMonthsAgo = new Date();
-    twelveMonthsAgo.setMonth(twelveMonthsAgo.getMonth() - 12);
-
-    const { data: monthlyRevenue } = await supabase
-      .from('transactions')
-      .select('amount, created_at')
-      .eq('status', 'COMPLETED')
-      .gte('created_at', twelveMonthsAgo.toISOString());
-
-    const revenueByMonth = monthlyRevenue?.reduce((acc, transaction) => {
-      const month = new Date(transaction.created_at).toISOString().substring(0, 7);
-      acc[month] = (acc[month] || 0) + transaction.amount;
-      return acc;
-    }, {} as Record<string, number>) || {};
-
-    const revenueStats = Object.entries(revenueByMonth).map(([month, revenue]) => ({
-      month,
-      revenue,
-    }));
-
-    // Get top courses by enrollment
-    const { data: topCourses } = await supabase
-      .from('courses')
-      .select(`
-        id,
-        title,
-        price,
-        enrollments(count)
-      `)
-      .order('enrollments.count', { ascending: false })
-      .limit(10);
-
-    // Calculate monthly growth
-    const currentMonth = new Date().toISOString().substring(0, 7);
-    const lastMonth = new Date();
-    lastMonth.setMonth(lastMonth.getMonth() - 1);
-    const lastMonthKey = lastMonth.toISOString().substring(0, 7);
-
-    const currentMonthUsers = registrationsByDate[currentMonth] || 0;
-    const lastMonthUsers = registrationsByDate[lastMonthKey] || 0;
-    const monthlyGrowth = lastMonthUsers > 0 ? ((currentMonthUsers - lastMonthUsers) / lastMonthUsers) * 100 : 0;
-
-    const dashboardData = {
-      totalUsers: totalUsers || 0,
-      totalCourses: totalCourses || 0,
-      totalRevenue,
-      monthlyGrowth,
-      userRegistrations: userRegistrationsChart,
-      revenueStats,
-      topCourses: topCourses?.map(course => ({
-        course,
-        enrollments: course.enrollments?.[0]?.count || 0,
-        revenue: (course.enrollments?.[0]?.count || 0) * course.price,
-      })) || [],
-    };
-
-    return NextResponse.json({
-      success: true,
-      data: dashboardData,
-    });
-  } catch (error) {
-    console.error('Admin dashboard error:', error);
-    return NextResponse.json(
-      { success: false, error: 'Failed to fetch dashboard data' },
-      { status: 500 }
-    );
-  }
+xport function withRole(allowedRoles: string[]) {
+  return function (handler: (req: AuthenticatedRequest) => Promise<NextResponse>) {
+    return async function (req: NextRequest) {
+      try {
+        const supabase = createServiceClient();
+        
+        // Get the authorization headerexport interface AuthenticatedRequest extends NextRequest {
+  user: {
+    id: string;
+    email: string;
+    role: string;
+  };
 }
 
-export const GET = withRateLimit(rateLimits.api)(withRole(['ADMIN'])(getAdminDashboardHandler));
+        const authHeader = req.headers.get('authorization');
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+          return NextResponse.json(
+            { success: false, error: 'Authentication required' },
+            { status: 401 }
+          );
+        }
+
+        const token = authHeader.substring(7);
+        
+        // Verify the token and get user
+        const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+        
+        if (authError || !user) {
+          return NextResponse.json(
+            { success: false, error: 'Invalid authentication token' },
+            { status: 401 }
+          );
+        }
+
+        // Get user profile with role
+        const { data: profile, error: profileError } = await supabase
+          .from('profiles')
+          .select('role')
+          .eq('id', user.id)
+          .single();
+
+        if (profileError || !profile) {
+          return NextResponse.json(
+            { success: false, error: 'User profile not found' },
+            { status: 403 }
+          );
+        }
+
+        // Check if user has required role
+        if (!allowedRoles.includes(profile.role)) {
+          return NextResponse.json(
+            { success: false, error: 'Insufficient permissions' },
+            { status: 403 }
+          );
+        }
+
+        // Add user info to request
+        const authenticatedReq = req as AuthenticatedRequest;
+        authenticatedReq.user = {
+          id: user.id,
+          email: user.email || '',
+          role: profile.role,
+        };
+
+        return handler(authenticatedReq);
+      } catch (error) {
+        console.error('Authentication middleware error:', error);
+        return NextResponse.json(
+          { success: false, error: 'Authentication failed' },
+          { status: 500 }
+        );
+      }
+    };
+  };
+}
